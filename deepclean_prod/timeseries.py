@@ -1,18 +1,15 @@
 
-import glob
 import h5py
 import copy
 from collections import OrderedDict
 
 import numpy as np
-
+import glob
 import torch
 
-from gwpy.timeseries import TimeSeries
 from gwpy.timeseries import TimeSeriesDict
 
 from .signal import bandpass
-
 
 class TimeSeriesDataset:
     """ Torch dataset in timeseries format """
@@ -31,23 +28,23 @@ class TimeSeriesDataset:
         if isinstance(channels, str):
             channels = open(channels).read().splitlines()
         target_channel = channels[0]
-        
-        # get data and resample
-        #data = TimeSeriesDict.get(channels, t0, t0 + duration, nproc=nproc, allow_tape=True)
-        data = TimeSeriesDict.read(
-            '/home/chiajui.chou/dc_training/dc_KAGRA/frame_files/K1-O4.gwf',
-            channels,
-            t0,
-            t0 + duration,
-            nproc=nproc,
-        )
 
+        ####################################################################################
+        source_gwf = glob.glob('/home/shuwei.yeh/data_bank/silent/*.gwf')
+
+        
+        data = TimeSeriesDict.read(
+            source = source_gwf,
+            channels = channels,
+            start = t0,
+            end = t0 + duration,
+            nproc = nproc
+            )
+        
         data = data.resample(fs)
-        
-        # sorted by channel name
-        data = OrderedDict(sorted(data.items()))
-        
-        # reset attributes 
+        ####################################################################################
+
+        ## reset attributes ##
         self.data = []
         self.channels = []
         for chan, ts in data.items():
@@ -58,7 +55,7 @@ class TimeSeriesDataset:
         self.t0 = t0
         self.fs = fs
         self.target_idx = np.where(self.channels == target_channel)[0][0]
-        
+
     def read(self, fname, channels, group=None):
         """ Read data from HDF5 format """
         # if channels is a file
@@ -231,4 +228,3 @@ class TimeSeriesSegmentDataset(TimeSeriesDataset):
         aux = torch.Tensor(aux)
         
         return aux, target
-    
