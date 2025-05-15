@@ -10,7 +10,9 @@ TRAIN_PARAMS = ('chanslist', 'train_t0', 'fs', 'train_duration', 'train_frac',
                 'filt_fl', 'filt_fh', 'filt_order', 'train_kernel', 'train_stride', 
                 'pad_mode', 'batch_size', 'max_epochs', 'num_workers', 'lr', 
                 'weight_decay', 'fftlength', 'overlap', 'psd_weight', 'mse_weight', 
+                'coh_weight',  # Add this line
                 'train_dir', 'save_dataset', 'load_dataset', 'log', 'device')
+
 
 # Parse command line argument
 def parse_cmd():

@@ -199,32 +199,28 @@ class TimeSeriesSegmentDataset(TimeSeriesDataset):
         
     def __getitem__(self, idx):
         """ Get sample Tensor for a given index """
-        # check if idx is valid:
         if idx < 0:
             idx +=  self.__len__()
         if idx >= self.__len__():
-            raise IndexError(
-                f'index {idx} is out of bound with size {self.__len__()}.')
-        
-        # get sample
+            raise IndexError(f'index {idx} is out of bound with size {self.__len__()}.')
+
         kernel = int(self.kernel * self.fs)
         stride = int(self.stride * self.fs)
         idx_start = idx * stride
         idx_stop = idx_start + kernel
         data = self.data[:, idx_start: idx_stop].copy()
         
-        # apply padding if needed
+        # padding if needed
         nsamp = data.shape[-1]
         if nsamp < kernel:
             pad = kernel - nsamp
             data = np.pad(data, ((0, 0), (0, pad)), mode=self.pad_mode)
-            
-        # separate into target HOFT and aux channel
+        
+        # separate target and aux, then re-stack: [aux, ..., target]
         target = data[self.target_idx]
         aux = np.delete(data, self.target_idx, axis=0)
-            
-        # convert into Tensor
-        target = torch.Tensor(target)
-        aux = torch.Tensor(aux)
         
-        return aux, target
+        # Concatenate so that target is the last channel
+        data_tensor = np.concatenate([aux, target[None, :]], axis=0)
+        
+        return torch.Tensor(data_tensor), torch.tensor(0) # dummy target for compatibility

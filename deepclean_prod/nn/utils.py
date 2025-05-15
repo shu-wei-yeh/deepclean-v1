@@ -58,109 +58,94 @@ def get_device(device):
 
 def train(train_loader, model, criterion, optimizer, lr_scheduler, 
           val_loader=None, max_epochs=1, logger=None, device='cpu'):
-    """ Train network """
+    """Train network with CompositePSDLoss that requires witness input"""
     
-    # if Logger is not given, create a default logger
     if logger is None:
         logger = Logger(outdir='outdir', label='run', metrics=['loss'])
     
-    # start training
     num_batches = len(train_loader)
     print_train()
+    
     for epoch in range(max_epochs):
-        
-        # Training
         train_loss = 0.
         model.train()
-        for i_batch, (data, target) in enumerate(train_loader):
-            optimizer.zero_grad() # reset gradient
+        
+        for i_batch, (data, _) in enumerate(train_loader):
+            optimizer.zero_grad()
             
-            # move batch to GPU if available
             data = data.to(device)
-            target = target.to(device)
+            witness = data[:, :-1, :]  # all channels except last
+            target = data[:, -1, :]    # last channel is target
             
-            # forward pass
-            pred = model(data)
-            
-            # calculate loss function and backward pass
-            loss = criterion(pred, target)
+            pred = model(witness)
+            loss = criterion(pred, target, witness)
             loss.backward()
             
-            # gradient descent
+            # Clip gradients after backward but before step
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
             
-            # Update training loss
             if criterion.reduction == 'mean':
                 train_loss += loss.item() * len(data)
             else:
                 train_loss += loss.item()
         
-        # Evaluating performance on validation set if given
-        val_loss = 0
+        # Validation
+        val_loss = 0.
         if val_loader is not None:
             model.eval()
             with torch.no_grad():
-                for i_batch, (data, target) in enumerate(val_loader):
-                    # move batch to GPU if available
+                for i_batch, (data, _) in enumerate(val_loader):
                     data = data.to(device)
-                    target = target.to(device)
-                
-                    # forward pass
-                    pred = model(data)
-                
-                    # calculate and update validation loss
-                    loss = criterion(pred, target)
+                    witness = data[:, :-1, :]
+                    target = data[:, -1, :]
+
+                    pred = model(witness)
+                    loss = criterion(pred, target, witness)
+                    
                     if criterion.reduction == 'mean':
                         val_loss += loss.item() * len(data)
                     else:
                         val_loss += loss.item()
         
-        # Compute average loss over all samples
         train_loss /= len(train_loader.dataset)
-        val_loss /= len(val_loader.dataset)
-            
-        # Update LR with scheduler at the end of each epoch
+        val_loss /= len(val_loader.dataset) if val_loader is not None else 1.0  # 避免除以0
+        
         if lr_scheduler is not None:
             lr_scheduler.step()
-       
-        # Update metric, display, and save
+        
         logger.update_metric(train_loss, val_loss, 'loss', epoch, 
                              num_batches, num_batches)
         logger.display_status(epoch, max_epochs, num_batches, num_batches,
                               train_loss, val_loss, 'loss')
         logger.log_metric()
         logger.save_model(model, epoch)
-    
-    
+
+
 def evaluate(dataloader, model, criterion=None, device='cpu'):
-    """ Inferring from dataloader. If `criterion` is given, also evaluate performance 
-    of the network provided that `dataloader` includes target """
+    """Evaluate model and return predictions and (optional) loss"""
     model.eval()
     eval_loss = 0.
     prediction = []
+
     with torch.no_grad():
-        for i_batch, (data, target) in enumerate(dataloader):
-            # move to GPU if available
+        for i_batch, (data, _) in enumerate(dataloader):
             data = data.to(device)
-            target = target.to(device)
-            
-            # compute prediction
-            pred = model(data)
+            witness = data[:, :-1, :]
+            target = data[:, -1, :]
+
+            pred = model(witness)
             prediction.append(pred.cpu().numpy())
             
-            # compute loss if criterion is given
             if criterion is not None:
-                loss = criterion(pred, target)
+                loss = criterion(pred, target, witness)
                 if criterion.reduction == 'mean':
-                    eval_loss += loss.item() * len(data)  
+                    eval_loss += loss.item() * len(data)
                 else:
                     eval_loss += loss.item()
+
     prediction = np.concatenate(prediction)
+    eval_loss /= len(dataloader.dataset) if criterion is not None else 1.0
     
-    # Averaging loss over the number of samples
-    eval_loss /= len(dataloader.dataset)
-    
-    # Return prediction and loss (if criterion is given)
-    if criterion is not None:
-        return prediction, eval_loss
-    return prediction
+    return (prediction, eval_loss) if criterion is not None else prediction

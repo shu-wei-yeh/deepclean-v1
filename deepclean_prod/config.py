@@ -1,4 +1,3 @@
-
 # Dataset default
 DEFAULT_SAMPLE_RATE = 16384
 DEFAULT_TRAIN_FRAC = 0.9
@@ -10,7 +9,7 @@ DEFAULT_MAX_EPOCHS = 50
 DEFAULT_LR = 1e-3
 DEFAULT_WEIGHT_DECAY = 1e-3
 
-# timeseries default
+# Timeseries default
 DEFAULT_TRAIN_KERNEL = 8.
 DEFAULT_TRAIN_STRIDE = 0.25
 DEFAULT_CLEAN_KERNEL = 8.
@@ -26,8 +25,9 @@ DEFAULT_FORDER = 8
 # Loss default
 DEFAULT_FFT_LENGTH = 2
 DEFAULT_OVERLAP = None
-DEFAULT_PSD_WEIGHT = 0.5
-DEFAULT_MSE_WEIGHT = 0.5
+DEFAULT_PSD_WEIGHT = 0.3       # Adjusted to allow room for coherence
+DEFAULT_MSE_WEIGHT = 0.3
+DEFAULT_COH_WEIGHT = 0.4       # NEW: Coherence loss weight
 
 # Device
 DEFAULT_DEVICE = 'cuda'
