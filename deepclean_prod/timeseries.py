@@ -30,9 +30,8 @@ class TimeSeriesDataset:
         target_channel = channels[0]
 
         ####################################################################################
-        source_gwf = glob.glob('/home/shuwei.yeh/data_bank/silent/*.gwf')
+        source_gwf = glob.glob('/home/shuwei.yeh/data_bank/o4c/*.gwf')
 
-        
         data = TimeSeriesDict.read(
             source = source_gwf,
             channels = channels,
