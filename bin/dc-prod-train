@@ -69,7 +69,9 @@ def parse_cmd():
     parser.add_argument('--mse-weight', help='MSE weight of composite',
                         default=config.DEFAULT_MSE_WEIGHT, type=float)
     parser.add_argument('--coh-weight', help='Coherence weight of composite loss',
-                        default=0.0, type=float)  # default to 0.0 if backward compatible
+                        default=0.0, type=float)  # NEW: Coherence loss weight, default to 0.0 if backward compatible
+    parser.add_argument('--tf-weight', help='Transfer Function weight of composite loss',
+                        default=0.0, type=float)  # NEW: Transfer Function loss weight, default to 0.0 if backward compatible
     parser.add_argument('--average', help='Average type for PSD computation',
                         default='mean', type=str)
     
@@ -81,6 +83,12 @@ def parse_cmd():
     parser.add_argument('--save-dataset', help='Save training dataset', 
                         default=False, type=dc.io.str2bool)
     parser.add_argument('--log', help='Log file', type=str)
+
+    # ## test test test test test test test test test test test test ##
+    # parser.add_argument('--prev-chanslist', help='INI used in previous training', type=str, default='')
+
+    # ## test test test test test test test test test test test test ##
+    # parser.add_argument('--checkpoint', help='Path to model checkpoint', type=str)
     
     # cuda arguments
     parser.add_argument('--device', help='Device to use', 
@@ -176,6 +184,86 @@ model = dc.nn.net.DeepClean(train_data.n_channels - 1)
 model = model.to(device)  # transfer model to GPU if available
 logging.info(model)
 
+# # ---------- 取 ckpt ----------
+# if params.checkpoint:                          # 使用者顯式指定
+#     if not os.path.isfile(params.checkpoint):
+#         raise FileNotFoundError(f'Checkpoint {params.checkpoint} does not exist')
+# else:                                          # 自動尋找
+#     params.checkpoint = dc.nn.utils.get_last_checkpoint(
+#         os.path.join(params.train_dir, 'models'))
+
+# # --------------------------------
+
+# old_chans, new_chans = [], []
+# if params.prev_chanslist:
+#     with open(params.prev_chanslist) as f:
+#         old_chans = [l.strip() for l in f if l.strip()][:-1]   # 去掉 target
+# with open(params.chanslist) as f:
+#     new_chans = [l.strip() for l in f if l.strip()][:-1]
+
+# # --- Smart weight loader -------------------------------------------------
+# def smart_load_weights(model, ckpt_path, old_chans, new_chans):
+#     if ckpt_path is None or (not os.path.isfile(ckpt_path)):
+#         logging.info('No compatible checkpoint — training from scratch')
+#         return
+
+#     state = torch.load(ckpt_path, map_location='cpu')
+#     sd_in = state if isinstance(state, dict) else state.state_dict()
+#     sd_out = {}                           # 真正要載入的 state-dict
+#     tgt_sd  = model.state_dict()          # 目標參數
+
+#     # ---------- 1. 先處理第一層卷積權重 -----------------
+#     conv_k = 'input_conv.0.weight'
+#     bias_k = 'input_conv.0.bias'
+#     if conv_k in sd_in:
+#         W_old = sd_in[conv_k]               # (C_out_old, C_in_old, k)
+#         W_new = tgt_sd[conv_k].clone()      # (C_out_new, C_in_new, k)
+
+#         idx_old = {ch: i for i, ch in enumerate(old_chans)}
+#         idx_new = {ch: i for i, ch in enumerate(new_chans)}
+#         copied  = 0
+#         min_out = min(W_new.shape[0], W_old.shape[0])
+
+#         for ch in new_chans:
+#             if ch in idx_old:
+#                 W_new[:min_out, idx_new[ch], :] = W_old[:min_out, idx_old[ch], :]
+#                 copied += 1
+#         sd_out[conv_k] = W_new
+
+#         # ---------- bias ----------
+#         if bias_k in sd_in:
+#             B_new = tgt_sd[bias_k].clone()
+#             B_old = sd_in[bias_k]
+#             B_new[:min_out] = B_old[:min_out]
+#             sd_out[bias_k] = B_new
+
+#         logging.info(f'Copied {copied}/{len(new_chans)} witness channels')
+#     # ----------------------------------------------------
+
+#     # ---------- 2. 其餘參數，只要 shape 相符就載入 -------
+#     for k, v in sd_in.items():
+#         if k in (conv_k, bias_k):      # 已處理
+#             continue
+#         if k in tgt_sd and v.shape == tgt_sd[k].shape:
+#             sd_out[k] = v              # shape 對得上才放進去
+#     # --------------------------------------------------
+
+#     # ---------- 3. 寬鬆載入 ----------------------------
+#     res = model.load_state_dict(sd_out, strict=False)
+#     miss = len(res.missing_keys) if res is not None and hasattr(res, 'missing_keys') else 'n/a'
+#     unexp = len(res.unexpected_keys) if res is not None and hasattr(res, 'unexpected_keys') else 'n/a'
+#     logging.info(f'Loaded weights ✓  missing:{miss}  unexpected:{unexp}')
+
+# # === 對位複製權重（一定要呼叫） ===
+# smart_load_weights(
+#     model,
+#     params.checkpoint,
+#     old_chans,
+#     new_chans
+# )
+# # -------------------------------------------------------------------------
+
+
 criterion = dc.criterion.CompositePSDLoss(
     params.fs, 
     params.filt_fl, 
@@ -184,7 +272,8 @@ criterion = dc.criterion.CompositePSDLoss(
     overlap=params.overlap, 
     psd_weight=params.psd_weight, 
     mse_weight=params.mse_weight, 
-    coh_weight=params.coh_weight,
+    coh_weight=params.coh_weight,   # NEW: Coherence loss weight
+    tf_weight=params.tf_weight,     # NEW: Transfer Function loss weight
     reduction='sum', 
     device=device,
     average=params.average

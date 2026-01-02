@@ -28,6 +28,7 @@ DEFAULT_OVERLAP = None
 DEFAULT_PSD_WEIGHT = 0.3       # Adjusted to allow room for coherence
 DEFAULT_MSE_WEIGHT = 0.3
 DEFAULT_COH_WEIGHT = 0.4       # NEW: Coherence loss weight
+DEFAULT_TF_WEIGHT = 0.0        # NEW: Transfer Function loss weight
 
 # Device
 DEFAULT_DEVICE = 'cuda'
