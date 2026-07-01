@@ -8,14 +8,21 @@ import scipy.signal as sig
 
 def _parse_window(nperseg, noverlap, window='boxcar'):
     """ Get window function """
-    if window == 'rect' or window =='rectangular':
-        window = 'boxcar'
-    window_fn = vars(sig)[window]
+    aliases = {
+        'rect': 'boxcar',
+        'rectangular': 'boxcar',
+        'hanning': 'hann',
+    }
+    window = aliases.get(window, window)
+
+    window_fn = getattr(sig.windows, window, None)
+    if window_fn is None:
+        window_fn = getattr(sig, window)
+
     if window != 'boxcar':
         return window_fn(nperseg) * (nperseg - noverlap) / nperseg * 2
     else:
         return window_fn(nperseg) * (nperseg - noverlap) / nperseg
-
 
 def resample(data, fs, new_fs, window='hamming', n=60):
     """ Resample using FIR filter. Method borrowed from gwpy.timeseries.TimeSeries
