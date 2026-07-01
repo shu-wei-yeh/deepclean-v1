@@ -17,11 +17,19 @@
 # along with DeepClean. If not, see <http://www.gnu.org/licenses/>.
 
 
-import pkg_resources
+# import pkg_resources
 from setuptools import setup, find_packages
 
-with open('requirements.txt', 'r') as f:
-    install_requires = [str(r) for r in pkg_resources.parse_requirements(f)]
+# with open('requirements.txt', 'r') as f:
+#     install_requires = [str(r) for r in pkg_resources.parse_requirements(f)]
+
+from pathlib import Path
+
+install_requires = [
+    line.strip()
+    for line in Path("requirements.txt").read_text().splitlines()
+    if line.strip() and not line.strip().startswith("#")
+]
 
 __version__ = '0.0.0'
     
