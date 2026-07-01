@@ -1,0 +1,69 @@
+# Modern GPU-capable DeepClean environment for NVIDIA Blackwell / sm_120.
+#
+# Purpose:
+#   - Support Blackwell GPUs such as RTX PRO 4000 Blackwell SFF Edition.
+#   - Also works on A100 / H100 if the NVIDIA driver is new enough.
+#   - Use PyTorch CUDA 12.8 wheels because PyTorch 2.5.1 + CUDA 12.4
+#     only supports up to sm_90 in dc-prod-v3.
+#
+# Create:
+#   micromamba env create -f environment-blackwell.yml
+#   micromamba activate dc-prod-v4-cu128
+#   python -m pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+#   python -m pip install "torchsummary>=1.5,<2"
+#   python -m pip install --no-build-isolation -e .
+#
+# Verify PyTorch/CUDA:
+#   python - <<'PY'
+#   import torch
+#   print(torch.__version__)
+#   print(torch.version.cuda)
+#   print(torch.cuda.is_available())
+#   print(torch.cuda.get_device_name(0))
+#   print(torch.cuda.get_device_capability(0))
+#   print(torch.cuda.get_arch_list())
+#   x = torch.linspace(0, 1, 1024, device="cuda")
+#   print(x[:3])
+#   PY
+#
+# Verify GWF backend:
+#   python -c "from gwpy.timeseries.io.gwf import get_default_gwf_api; print(get_default_gwf_api())"
+
+name: dc-prod-v4-cu128
+
+channels:
+  - conda-forge
+  - nodefaults
+
+dependencies:
+  # Python / packaging
+  - python=3.12
+  - pip
+  - "setuptools<81"
+  - wheel
+
+  # Core numeric stack
+  - numpy>=1.26,<3
+  - scipy>=1.12,<2
+  - h5py>=3.10,<4
+  - matplotlib-base>=3.8,<4
+  - tqdm>=4.66,<5
+
+  # IGWN / LIGO / astronomy stack used by DeepClean data IO
+  - astropy>=6,<8
+  - gwpy>=3,<4
+  - gwdatafind>=1,<2
+  - gwosc>=0.7,<1
+  - dqsegdb2>=1,<2
+  - ligo-segments>=1.4,<2
+  - ligotimegps>=2,<3
+  - python-nds2-client>=0.16,<1
+
+  # GWF frame I/O backend used by gwpy for .gwf files
+  - lalframe
+  - python-lalframe
+
+  # Runtime helpers
+  - click>=8,<9
+  - dill>=0.3,<1
+  - multiprocess>=0.70,<1
