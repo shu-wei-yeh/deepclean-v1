@@ -33,7 +33,7 @@ class TimeSeriesDataset:
         target_channel = channels[0]
 
         source_gwf = sorted(
-            glob.glob('/home/shuwei.yeh/data_bank/o4a/*/*.gwf')
+            glob.glob('/home/shuwei.yeh/data_bank/o4c/*/*.gwf')
         )
 
         data = TimeSeriesDict.read(
