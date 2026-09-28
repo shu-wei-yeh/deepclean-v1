@@ -3,9 +3,7 @@
 import os
 import pickle
 import argparse
-import logging.config
-
-import numpy as np
+import logging
 
 import torch
 import torch.optim as optim
@@ -14,263 +12,507 @@ from torch.utils.data import DataLoader
 import deepclean_prod as dc
 import deepclean_prod.config as config
 
-# Default tensor type
+
 torch.set_default_tensor_type(torch.FloatTensor)
 
 
 def parse_cmd():
-
     parser = argparse.ArgumentParser(
-        prog=os.path.basename(__file__), usage='%(prog)s [options]')
+        prog=os.path.basename(__file__),
+        usage='%(prog)s [options]',
+    )
 
-    # dataset arguments
-    parser.add_argument('--train-t0', help='GPS of the first sample', type=int)
-    parser.add_argument('--train-duration',
-                        help='Duration of train/val frame', type=int)
-    parser.add_argument('--chanslist', help='Path to channel list', type=str)
-    parser.add_argument('--fs', help='Sampling frequency',
-                        default=config.DEFAULT_SAMPLE_RATE, type=float)
-    parser.add_argument('--train-frac', help='Training/validation partition',
-                        default=config.DEFAULT_TRAIN_FRAC, type=float)
+    # Dataset
+    parser.add_argument('--train-t0', type=int)
+    parser.add_argument('--train-duration', type=int)
+    parser.add_argument('--chanslist', type=str)
+    parser.add_argument(
+        '--fs',
+        default=config.DEFAULT_SAMPLE_RATE,
+        type=float,
+    )
+    parser.add_argument(
+        '--train-frac',
+        default=config.DEFAULT_TRAIN_FRAC,
+        type=float,
+    )
 
-    # preprocess arguments
-    parser.add_argument('--filt-fl', help='Bandpass filter low frequency',
-                        default=config.DEFAULT_FLOW, nargs='+', type=float)
-    parser.add_argument('--filt-fh', help='Bandpass filter high frequency',
-                        default=config.DEFAULT_FHIGH, nargs='+', type=float)
-    parser.add_argument('--filt-order', help='Bandpass filter order',
-                        default=config.DEFAULT_FORDER, type=int)
+    # Preprocess
+    parser.add_argument(
+        '--filt-fl',
+        default=config.DEFAULT_FLOW,
+        nargs='+',
+        type=float,
+    )
+    parser.add_argument(
+        '--filt-fh',
+        default=config.DEFAULT_FHIGH,
+        nargs='+',
+        type=float,
+    )
+    parser.add_argument(
+        '--filt-order',
+        default=config.DEFAULT_FORDER,
+        type=int,
+    )
 
-    # timeseries arguments
-    parser.add_argument('--train-kernel', help='Length of each segment in seconds',
-                        default=config.DEFAULT_TRAIN_KERNEL, type=float)
-    parser.add_argument('--train-stride', help='Stride between segments in seconds',
-                        default=config.DEFAULT_TRAIN_STRIDE, type=float)
-    parser.add_argument('--pad-mode', help='Padding mode',
-                        default=config.DEFAULT_PAD_MODE, type=str)
+    # Time-series segmentation
+    parser.add_argument(
+        '--train-kernel',
+        default=config.DEFAULT_TRAIN_KERNEL,
+        type=float,
+    )
+    parser.add_argument(
+        '--train-stride',
+        default=config.DEFAULT_TRAIN_STRIDE,
+        type=float,
+    )
+    parser.add_argument(
+        '--pad-mode',
+        default=config.DEFAULT_PAD_MODE,
+        type=str,
+    )
 
-    # training arguments
-    parser.add_argument('--batch-size', help='Batch size',
-                        default=config.DEFAULT_BATCH_SIZE, type=int)
-    parser.add_argument('--max-epochs', help='Maximum number of epochs to train on',
-                        default=config.DEFAULT_MAX_EPOCHS, type=int)
-    parser.add_argument('--num-workers', help='Number of worker of DataLoader',
-                        default=config.DEFAULT_NUM_WORKERS, type=int)
-    parser.add_argument('--lr', help='Learning rate of ADAM optimizer',
-                        default=config.DEFAULT_LR, type=float)
-    parser.add_argument('--weight-decay', help='Weight decay of ADAM optimizer',
-                        default=config.DEFAULT_WEIGHT_DECAY, type=float)
+    # Training
+    parser.add_argument(
+        '--batch-size',
+        default=config.DEFAULT_BATCH_SIZE,
+        type=int,
+    )
+    parser.add_argument(
+        '--max-epochs',
+        default=config.DEFAULT_MAX_EPOCHS,
+        type=int,
+    )
+    parser.add_argument(
+        '--num-workers',
+        default=config.DEFAULT_NUM_WORKERS,
+        type=int,
+    )
+    parser.add_argument(
+        '--lr',
+        default=config.DEFAULT_LR,
+        type=float,
+    )
+    parser.add_argument(
+        '--weight-decay',
+        default=config.DEFAULT_WEIGHT_DECAY,
+        type=float,
+    )
 
-    # loss function arguments
-    parser.add_argument('--fftlength', help='FFT length of loss PSD',
-                        default=config.DEFAULT_FFT_LENGTH, type=float)
-    parser.add_argument('--overlap', help='Overlapping of loss PSD',
-                        default=config.DEFAULT_OVERLAP, type=float)
-    parser.add_argument('--psd-weight', help='PSD weight of composite loss',
-                        default=config.DEFAULT_PSD_WEIGHT, type=float)
-    parser.add_argument('--mse-weight', help='MSE weight of composite',
-                        default=config.DEFAULT_MSE_WEIGHT, type=float)
-    parser.add_argument('--coh-weight', help='Coherence weight of composite loss',
-                        # NEW: Coherence loss weight, default to 0.0 if backward compatible
-                        default=0.0, type=float)
-    parser.add_argument('--tf-weight', help='Transfer Function weight of composite loss',
-                        # NEW: Transfer Function loss weight, default to 0.0 if backward compatible
-                        default=0.0, type=float)
-    parser.add_argument('--average', help='Average type for PSD computation',
-                        default='mean', type=str)
+    # Loss spectral settings
+    parser.add_argument(
+        '--fftlength',
+        default=config.DEFAULT_FFT_LENGTH,
+        type=float,
+    )
+    parser.add_argument(
+        '--overlap',
+        default=config.DEFAULT_OVERLAP,
+        type=float,
+    )
+    parser.add_argument(
+        '--average',
+        default='mean',
+        choices=['mean', 'median'],
+    )
 
-    # input/output arguments
-    parser.add_argument('--train-dir', help='Path to training directory',
-                        default='.', type=str)
-    parser.add_argument('--load-dataset', help='Load training dataset',
-                        default=False, type=dc.io.str2bool)
-    parser.add_argument('--save-dataset', help='Save training dataset',
-                        default=False, type=dc.io.str2bool)
-    parser.add_argument('--log', help='Log file', type=str)
+    # ----------------------------------------------------------
+    # Loss weights
+    #
+    # These are INDEPENDENT coefficients.
+    # They do NOT need to sum to 1.
+    #
+    # Historical baseline requested here:
+    # PSD=1.0, MSE=0.0, COH=0.0, TF=0.0
+    # ----------------------------------------------------------
+    parser.add_argument(
+        '--psd-weight',
+        default=1.0,
+        type=float,
+    )
+    parser.add_argument(
+        '--mse-weight',
+        default=0.0,
+        type=float,
+    )
+    parser.add_argument(
+        '--coh-weight',
+        default=0.0,
+        type=float,
+    )
+    parser.add_argument(
+        '--tf-weight',
+        default=0.0,
+        type=float,
+    )
 
-    # ## test test test test test test test test test test test test ##
-    # parser.add_argument('--prev-chanslist', help='INI used in previous training', type=str, default='')
+    # Physics-loss controls
+    parser.add_argument(
+        '--target-coh-gate',
+        default=0.05,
+        type=float,
+        help=(
+            'Only frequencies with original target-witness coherence '
+            'above this value contribute to COH/TF losses.'
+        ),
+    )
+    parser.add_argument(
+        '--channel-coh-threshold',
+        default=0.03,
+        type=float,
+        help=(
+            'Minimum band-mean target coherence used for witness '
+            'channel weighting in COH/TF losses.'
+        ),
+    )
+    parser.add_argument(
+        '--loss-channel-chunk-size',
+        default=8,
+        type=int,
+        help=(
+            'Number of witness channels processed together inside '
+            'COH/TF losses. This affects memory, not channel selection.'
+        ),
+    )
 
-    # ## test test test test test test test test test test test test ##
-    # parser.add_argument('--checkpoint', help='Path to model checkpoint', type=str)
+    # Timing/profile controls
+    parser.add_argument(
+        '--profile-loss-time',
+        default=False,
+        type=dc.io.str2bool,
+        help=(
+            'Measure PSD/MSE/COH/TF forward-computation time. '
+            'CUDA synchronization makes profiling slower.'
+        ),
+    )
+    parser.add_argument(
+        '--loss-timing-warmup',
+        default=5,
+        type=int,
+        help='Number of first criterion calls excluded from timing averages.',
+    )
 
-    # cuda arguments
-    parser.add_argument('--device', help='Device to use',
-                        default=config.DEFAULT_DEVICE, type=str)
+    # Input/output
+    parser.add_argument(
+        '--train-dir',
+        default='.',
+        type=str,
+    )
+    parser.add_argument(
+        '--load-dataset',
+        default=False,
+        type=dc.io.str2bool,
+    )
+    parser.add_argument(
+        '--save-dataset',
+        default=False,
+        type=dc.io.str2bool,
+    )
+    parser.add_argument('--log', type=str)
 
-    params = parser.parse_args()
-    return params
+    # Device
+    parser.add_argument(
+        '--device',
+        default=config.DEFAULT_DEVICE,
+        type=str,
+    )
+
+    # Early stopping
+    parser.add_argument(
+        "--early-stopping",
+        default=config.DEFAULT_EARLY_STOPPING,
+        type=dc.io.str2bool,
+        help="Enable validation-loss early stopping.",
+    )
+
+    parser.add_argument(
+        "--early-stopping-patience",
+        default=config.DEFAULT_EARLY_STOPPING_PATIENCE,
+        type=int,
+        help=(
+            "Stop after this many consecutive epochs without "
+            "a validation-loss improvement."
+        ),
+    )
+
+    parser.add_argument(
+        "--early-stopping-min-delta",
+        default=config.DEFAULT_EARLY_STOPPING_MIN_DELTA,
+        type=float,
+        help=(
+            "Minimum validation-loss decrease required to count "
+            "as an improvement."
+        ),
+    )
+
+    parser.add_argument(
+        "--early-stopping-min-epochs",
+        default=config.DEFAULT_EARLY_STOPPING_MIN_EPOCHS,
+        type=int,
+        help=(
+            "Do not stop before this many epochs have completed."
+        ),
+    )
+
+    return parser.parse_args()
 
 
 params = parse_cmd()
 
-# Create output directory
+# ----------------------------------------------------------------------
+# Validate loss configuration
+# ----------------------------------------------------------------------
+weights = {
+    'psd': params.psd_weight,
+    'mse': params.mse_weight,
+    'coh': params.coh_weight,
+    'tf': params.tf_weight,
+}
+
+if any(v < 0 for v in weights.values()):
+    raise ValueError('Loss weights must be non-negative')
+
+if sum(weights.values()) <= 0:
+    raise ValueError('At least one loss weight must be > 0')
+
+# IMPORTANT:
+# There is intentionally NO requirement that the weights sum to 1.
+
+if params.early_stopping_patience < 1:
+    raise ValueError('--early-stopping-patience must be >= 1')
+
+if params.early_stopping_min_delta < 0:
+    raise ValueError('--early-stopping-min-delta must be >= 0')
+
+if params.early_stopping_min_epochs < 0:
+    raise ValueError('--early-stopping-min-epochs must be >= 0')
+
+
+# ----------------------------------------------------------------------
+# Output/logging
+# ----------------------------------------------------------------------
 os.makedirs(params.train_dir, exist_ok=True)
+
 if params.log is not None:
     params.log = os.path.join(params.train_dir, params.log)
-logging.basicConfig(filename=params.log, filemode='a',
-                    format='%(asctime)s - %(message)s', level=logging.DEBUG)
-logging.info('Create training directory: {}'.format(params.train_dir))
 
-# Use GPU if available
+logging.basicConfig(
+    filename=params.log,
+    filemode='a',
+    format='%(asctime)s - %(message)s',
+    level=logging.DEBUG,
+)
+
+logging.info(
+    'Create training directory: {}'.format(params.train_dir)
+)
+
+logging.info(
+    'Loss configuration: '
+    'PSD={} MSE={} COH={} TF={} (sum={}; no normalization)'.format(
+        params.psd_weight,
+        params.mse_weight,
+        params.coh_weight,
+        params.tf_weight,
+        sum(weights.values()),
+    )
+)
+
+logging.info(
+    'Physics-loss controls: '
+    'target_coh_gate={} channel_coh_threshold={} chunk_size={}'.format(
+        params.target_coh_gate,
+        params.channel_coh_threshold,
+        params.loss_channel_chunk_size,
+    )
+)
+
+logging.info(
+    'Loss timing enabled: {}'.format(params.profile_loss_time)
+)
+
+logging.info(
+    'Early stopping: enabled={} patience={} min_delta={} min_epochs={}'.format(
+        params.early_stopping,
+        params.early_stopping_patience,
+        params.early_stopping_min_delta,
+        params.early_stopping_min_epochs,
+    )
+)
+
+
+# ----------------------------------------------------------------------
+# Device
+# ----------------------------------------------------------------------
 device = dc.nn.utils.get_device(params.device)
 
-# Get data from NDS server or local
+
+# ----------------------------------------------------------------------
+# Datasets
+# ----------------------------------------------------------------------
 train_data = dc.timeseries.TimeSeriesSegmentDataset(
-    params.train_kernel, params.train_stride, params.pad_mode)
+    params.train_kernel,
+    params.train_stride,
+    params.pad_mode,
+)
+
 val_data = dc.timeseries.TimeSeriesSegmentDataset(
-    params.train_kernel, params.train_stride, params.pad_mode)
+    params.train_kernel,
+    params.train_stride,
+    params.pad_mode,
+)
 
 
-if (params.train_t0 is None) and (params.train_duration is None):
-    logging.info('GPS Time not given. Fetching from training directory: {}'.format(
-        params.train_dir))
+if (
+    params.train_t0 is None
+    and params.train_duration is None
+):
+    logging.info(
+        'GPS time not given. Loading datasets from training directory.'
+    )
 
-    train_data.read(os.path.join(params.train_dir,
-                    'training.h5'), params.chanslist)
-    val_data.read(os.path.join(params.train_dir,
-                  'validation.h5'), params.chanslist)
+    train_data.read(
+        os.path.join(params.train_dir, 'training.h5'),
+        params.chanslist,
+    )
+    val_data.read(
+        os.path.join(params.train_dir, 'validation.h5'),
+        params.chanslist,
+    )
+
 elif params.load_dataset:
-    logging.info('Fetch from training directory: {}'.format(params.train_dir))
+    logging.info(
+        'Loading datasets from {}'.format(params.train_dir)
+    )
 
-    train_data.read(os.path.join(params.train_dir,
-                    'training.h5'), params.chanslist)
-    val_data.read(os.path.join(params.train_dir,
-                  'validation.h5'), params.chanslist)
+    train_data.read(
+        os.path.join(params.train_dir, 'training.h5'),
+        params.chanslist,
+    )
+    val_data.read(
+        os.path.join(params.train_dir, 'validation.h5'),
+        params.chanslist,
+    )
+
 else:
-    # Partition into training and validation dataset
     train_t0 = params.train_t0
-    train_duration = int(params.train_duration * params.train_frac)
+    train_duration = int(
+        params.train_duration * params.train_frac
+    )
+
     val_t0 = train_t0 + train_duration
     val_duration = params.train_duration - train_duration
 
-    logging.info('Fetching training data from {} .. {}'.format(
-        train_t0, train_t0 + train_duration))
-    train_data.fetch(params.chanslist, train_t0, train_duration, params.fs)
+    logging.info(
+        'Fetching training data from {} to {}'.format(
+            train_t0,
+            train_t0 + train_duration,
+        )
+    )
+    train_data.fetch(
+        params.chanslist,
+        train_t0,
+        train_duration,
+        params.fs,
+    )
 
-    logging.info('Fetching validation data from {} .. {}'.format(
-        val_t0, val_t0 + val_duration))
-    val_data.fetch(params.chanslist, val_t0, val_duration, params.fs)
+    logging.info(
+        'Fetching validation data from {} to {}'.format(
+            val_t0,
+            val_t0 + val_duration,
+        )
+    )
+    val_data.fetch(
+        params.chanslist,
+        val_t0,
+        val_duration,
+        params.fs,
+    )
 
-    # Save training/validation data if enabled
     if params.save_dataset:
-        train_data.write(os.path.join(params.train_dir, 'training.h5'))
-        val_data.write(os.path.join(params.train_dir, 'validation.h5'))
+        train_data.write(
+            os.path.join(params.train_dir, 'training.h5')
+        )
+        val_data.write(
+            os.path.join(params.train_dir, 'validation.h5')
+        )
 
-# Preprocess data
+
+# ----------------------------------------------------------------------
+# Preprocess
+# ----------------------------------------------------------------------
 logging.info('Preprocessing')
-# bandpass filter
-train_data = train_data.bandpass(
-    params.filt_fl, params.filt_fh, params.filt_order, 'target')
-val_data = val_data.bandpass(
-    params.filt_fl, params.filt_fh, params.filt_order, 'target')
 
-# normalization
+# Preserve current DeepClean behavior: bandpass the TARGET only.
+train_data = train_data.bandpass(
+    params.filt_fl,
+    params.filt_fh,
+    params.filt_order,
+    'target',
+)
+
+val_data = val_data.bandpass(
+    params.filt_fl,
+    params.filt_fh,
+    params.filt_order,
+    'target',
+)
+
 mean = train_data.mean
 std = train_data.std
+
 train_data = train_data.normalize()
 val_data = val_data.normalize(mean, std)
 
-# Save preprocessing setting
-with open(os.path.join(params.train_dir, 'ppr.bin'), 'wb') as f:
-    pickle.dump({
-        'mean': mean,
-        'std': std,
-        'filt_fl': params.filt_fl,
-        'filt_fh': params.filt_fh,
-        'filt_order': params.filt_order,
-    }, f, protocol=-1)
 
-# Read dataset into DataLoader
+with open(
+    os.path.join(params.train_dir, 'ppr.bin'),
+    'wb',
+) as f:
+    pickle.dump(
+        {
+            'mean': mean,
+            'std': std,
+            'filt_fl': params.filt_fl,
+            'filt_fh': params.filt_fh,
+            'filt_order': params.filt_order,
+        },
+        f,
+        protocol=-1,
+    )
+
+
+# ----------------------------------------------------------------------
+# DataLoaders
+# ----------------------------------------------------------------------
 train_loader = DataLoader(
-    train_data, params.batch_size, num_workers=params.num_workers)
+    train_data,
+    params.batch_size,
+    num_workers=params.num_workers,
+    shuffle=False,
+)
+
 val_loader = DataLoader(
-    val_data, params.batch_size, num_workers=params.num_workers)
+    val_data,
+    params.batch_size,
+    num_workers=params.num_workers,
+    shuffle=False,
+)
 
-# Creating model, loss function, optimizer and lr scheduler
-logging.info('Creating neural network, loss function, optimizer, etc.')
-model = dc.nn.net.DeepClean(train_data.n_channels - 1)
-model = model.to(device)  # transfer model to GPU if available
+
+# ----------------------------------------------------------------------
+# Model / loss / optimizer
+# ----------------------------------------------------------------------
+logging.info(
+    'Creating neural network, loss function, optimizer, etc.'
+)
+
+model = dc.nn.net.DeepClean(
+    train_data.n_channels - 1
+).to(device)
+
 logging.info(model)
-
-# # ---------- 取 ckpt ----------
-# if params.checkpoint:                          # 使用者顯式指定
-#     if not os.path.isfile(params.checkpoint):
-#         raise FileNotFoundError(f'Checkpoint {params.checkpoint} does not exist')
-# else:                                          # 自動尋找
-#     params.checkpoint = dc.nn.utils.get_last_checkpoint(
-#         os.path.join(params.train_dir, 'models'))
-
-# # --------------------------------
-
-# old_chans, new_chans = [], []
-# if params.prev_chanslist:
-#     with open(params.prev_chanslist) as f:
-#         old_chans = [l.strip() for l in f if l.strip()][:-1]   # 去掉 target
-# with open(params.chanslist) as f:
-#     new_chans = [l.strip() for l in f if l.strip()][:-1]
-
-# # --- Smart weight loader -------------------------------------------------
-# def smart_load_weights(model, ckpt_path, old_chans, new_chans):
-#     if ckpt_path is None or (not os.path.isfile(ckpt_path)):
-#         logging.info('No compatible checkpoint — training from scratch')
-#         return
-
-#     state = torch.load(ckpt_path, map_location='cpu')
-#     sd_in = state if isinstance(state, dict) else state.state_dict()
-#     sd_out = {}                           # 真正要載入的 state-dict
-#     tgt_sd  = model.state_dict()          # 目標參數
-
-#     # ---------- 1. 先處理第一層卷積權重 -----------------
-#     conv_k = 'input_conv.0.weight'
-#     bias_k = 'input_conv.0.bias'
-#     if conv_k in sd_in:
-#         W_old = sd_in[conv_k]               # (C_out_old, C_in_old, k)
-#         W_new = tgt_sd[conv_k].clone()      # (C_out_new, C_in_new, k)
-
-#         idx_old = {ch: i for i, ch in enumerate(old_chans)}
-#         idx_new = {ch: i for i, ch in enumerate(new_chans)}
-#         copied  = 0
-#         min_out = min(W_new.shape[0], W_old.shape[0])
-
-#         for ch in new_chans:
-#             if ch in idx_old:
-#                 W_new[:min_out, idx_new[ch], :] = W_old[:min_out, idx_old[ch], :]
-#                 copied += 1
-#         sd_out[conv_k] = W_new
-
-#         # ---------- bias ----------
-#         if bias_k in sd_in:
-#             B_new = tgt_sd[bias_k].clone()
-#             B_old = sd_in[bias_k]
-#             B_new[:min_out] = B_old[:min_out]
-#             sd_out[bias_k] = B_new
-
-#         logging.info(f'Copied {copied}/{len(new_chans)} witness channels')
-#     # ----------------------------------------------------
-
-#     # ---------- 2. 其餘參數，只要 shape 相符就載入 -------
-#     for k, v in sd_in.items():
-#         if k in (conv_k, bias_k):      # 已處理
-#             continue
-#         if k in tgt_sd and v.shape == tgt_sd[k].shape:
-#             sd_out[k] = v              # shape 對得上才放進去
-#     # --------------------------------------------------
-
-#     # ---------- 3. 寬鬆載入 ----------------------------
-#     res = model.load_state_dict(sd_out, strict=False)
-#     miss = len(res.missing_keys) if res is not None and hasattr(res, 'missing_keys') else 'n/a'
-#     unexp = len(res.unexpected_keys) if res is not None and hasattr(res, 'unexpected_keys') else 'n/a'
-#     logging.info(f'Loaded weights ✓  missing:{miss}  unexpected:{unexp}')
-
-# # === 對位複製權重（一定要呼叫） ===
-# smart_load_weights(
-#     model,
-#     params.checkpoint,
-#     old_chans,
-#     new_chans
-# )
-# # -------------------------------------------------------------------------
 
 
 criterion = dc.criterion.CompositePSDLoss(
@@ -279,23 +521,59 @@ criterion = dc.criterion.CompositePSDLoss(
     params.filt_fh,
     fftlength=params.fftlength,
     overlap=params.overlap,
+
     psd_weight=params.psd_weight,
     mse_weight=params.mse_weight,
-    coh_weight=params.coh_weight,   # NEW: Coherence loss weight
-    tf_weight=params.tf_weight,     # NEW: Transfer Function loss weight
+    coh_weight=params.coh_weight,
+    tf_weight=params.tf_weight,
+
     reduction='sum',
     device=device,
-    average=params.average
+    average=params.average,
+
+    target_coh_gate=params.target_coh_gate,
+    channel_coh_threshold=params.channel_coh_threshold,
+    channel_chunk_size=params.loss_channel_chunk_size,
+
+    enable_timing=params.profile_loss_time,
+    timing_warmup=params.loss_timing_warmup,
 )
 
+
 optimizer = optim.Adam(
-    model.parameters(), lr=params.lr, weight_decay=params.weight_decay)
+    model.parameters(),
+    lr=params.lr,
+    weight_decay=params.weight_decay,
+)
 
-lr_scheduler = optim.lr_scheduler.StepLR(optimizer, 10, 0.1)
+lr_scheduler = optim.lr_scheduler.StepLR(
+    optimizer,
+    step_size=10,
+    gamma=0.1,
+)
 
-# Start training
-train_logger = dc.logger.Logger(outdir=params.train_dir, metrics=['loss'])
+
+# ----------------------------------------------------------------------
+# Train
+# ----------------------------------------------------------------------
+train_logger = dc.logger.Logger(
+    outdir=params.train_dir,
+    metrics=['loss'],
+)
+
 dc.nn.utils.train(
-    train_loader, model, criterion, optimizer, lr_scheduler,
-    val_loader=val_loader, max_epochs=params.max_epochs, logger=train_logger,
-    device=device)
+    train_loader,
+    model,
+    criterion,
+    optimizer,
+    lr_scheduler,
+    val_loader=val_loader,
+    max_epochs=params.max_epochs,
+    logger=train_logger,
+    device=device,
+
+    early_stopping=params.early_stopping,
+    early_stopping_patience=params.early_stopping_patience,
+    early_stopping_min_delta=params.early_stopping_min_delta,
+    early_stopping_min_epochs=params.early_stopping_min_epochs,
+)

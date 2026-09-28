@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
+import time
 
 # ---------- Compatibility helpers ----------
 _HAS_TORCHFFT = hasattr(torch, "fft") and hasattr(torch.fft, "rfft")
@@ -499,7 +500,7 @@ class MSELoss(nn.Module):
 
 class PSDLoss(nn.Module):
     def __init__(self, fs=1.0, fl=20., fh=500., fftlength=1., overlap=None,
-                 asd=False, average='mean', reduction='mean', device='cpu'):
+                 asd=True, average='mean', reduction='mean', device='cpu'):
         super().__init__()
         if isinstance(fl, (int, float)):
             fl = (fl,)
@@ -553,31 +554,26 @@ class PSDLoss(nn.Module):
 
 class CoherenceLoss(nn.Module):
     """
-    Memory-optimized band-limited residual coherence loss.
+    Band-limited residual-coherence loss.
 
-    Key points
-    ----------
-    1. All witness channels are still used.
-    2. Witness channels are processed in chunks to reduce peak memory.
-    3. residual PSD is computed only once.
-    4. target PSD is computed only once under no_grad.
-    5. target-witness coherence is computed under no_grad.
-    6. channel losses are accumulated in streaming form,
-       without stacking all channel losses and weights.
-
-    Loss idea
-    ---------
     residual = target - pred
 
-    Minimize:
+    The loss is evaluated only where the original target-witness coherence is
+    meaningful.  Witnesses are processed in chunks to reduce peak GPU memory.
 
-        coherence(residual, witness)
-        ----------------------------
-        coherence(target, witness)
+    Important defaults
+    ------------------
+    target_coh_gate = 0.05
+        Frequencies with target-witness coherence below this value do not
+        contribute to the loss.
 
-    inside the selected frequency band.
+    channel_coh_threshold = 0.03
+        Channels whose mean target coherence is below this level receive zero
+        channel weight.
 
-    High target-witness coherence channels receive larger channel weights.
+    fallback_to_uniform_channels = False
+        If no channel has meaningful target coherence, this loss returns zero
+        rather than forcing the model to optimize unrelated witnesses.
     """
 
     def __init__(
@@ -585,38 +581,36 @@ class CoherenceLoss(nn.Module):
         fs,
         fl,
         fh,
-        fftlength=1.,
+        fftlength=1.0,
         overlap=None,
         reduction='mean',
         device='cpu',
         average='mean',
         coh_floor=1e-3,
+        target_coh_gate=0.05,
         weight_by_target_coh=True,
-        min_weight_sum=1e-8,
         use_log=True,
-
-        # Channel-level weighting
         channel_coh_threshold=0.03,
         channel_weight_power=1.0,
         min_channel_weight_sum=1e-8,
-        fallback_to_uniform_channels=True,
-
-        # Internal computational chunking.
-        # This does NOT reduce the number of witness channels used in the loss.
+        fallback_to_uniform_channels=False,
         channel_chunk_size=8,
     ):
         super().__init__()
 
+        if reduction not in ('mean', 'sum'):
+            raise ValueError('`reduction` must be "mean" or "sum"')
+
         self.fs = fs
         self.nperseg = int(fftlength * fs)
-        self.noverlap = int(overlap * fs) if overlap else None
+        self.noverlap = int(overlap * fs) if overlap is not None else None
         self.reduction = reduction
         self.device = device
         self.average = average
 
         self.coh_floor = float(coh_floor)
+        self.target_coh_gate = float(target_coh_gate)
         self.weight_by_target_coh = bool(weight_by_target_coh)
-        self.min_weight_sum = float(min_weight_sum)
         self.use_log = bool(use_log)
 
         self.channel_coh_threshold = float(channel_coh_threshold)
@@ -629,31 +623,18 @@ class CoherenceLoss(nn.Module):
             raise ValueError("channel_chunk_size must be positive")
 
         freq = torch.linspace(
-            0.,
-            fs / 2.,
-            self.nperseg // 2 + 1,
-            device=device,
+            0.0, fs / 2.0, self.nperseg // 2 + 1, device=device
         )
 
-        self.dfreq = freq[1] - freq[0]
-
-        freq_mask = torch.zeros_like(
-            freq,
-            dtype=torch.uint8,
-            device=device,
-        )
-
-        if not isinstance(fl, (list, tuple)):
+        if isinstance(fl, (int, float)):
             fl = [fl]
-        if not isinstance(fh, (list, tuple)):
+        if isinstance(fh, (int, float)):
             fh = [fh]
 
-        self.scale = 0.0
-
+        freq_mask = torch.zeros_like(freq, dtype=torch.uint8, device=device)
         for l, h in zip(fl, fh):
             band = ((freq >= l) & (freq <= h)).to(torch.uint8)
             freq_mask = torch.max(freq_mask, band)
-            self.scale += (h - l)
 
         self.register_buffer("freq_mask", freq_mask)
         self.register_buffer("freq_mask_float", freq_mask.float())
@@ -696,231 +677,133 @@ class CoherenceLoss(nn.Module):
         )
 
     def forward(self, pred, target, witness):
-        """
-        Parameters
-        ----------
-        pred : torch.Tensor
-            Predicted noise, shape (B, T)
-
-        target : torch.Tensor
-            Target strain, shape (B, T)
-
-        witness : torch.Tensor
-            Witness channels, shape (B, C, T)
-        """
-
         residual = target - pred
 
-        B, C, T = witness.shape
+        if witness.ndim != 3:
+            raise ValueError("witness must have shape (B, C, T)")
+
+        B, C, _ = witness.shape
 
         if C == 0:
-            zero = torch.sum(pred * 0.0)
-            return zero
+            return torch.sum(pred * 0.0)
 
-        # Frequency mask: shape (1, 1, F)
-        mask = self.freq_mask_float.view(1, 1, -1)
+        band_mask = self.freq_mask_float.view(1, 1, -1)
 
-        # ------------------------------------------------------------
-        # Shared spectra.
-        # Srr needs gradient because residual depends on pred.
-        # Stt is only a reference, so no_grad is safe.
-        # ------------------------------------------------------------
-        Srr = self._welch_1d(residual)  # (B, F)
-
+        # residual PSD carries gradients; target PSD is reference-only
+        Srr = self._welch_1d(residual).view(B, 1, -1)
         with torch.no_grad():
-            Stt = self._welch_1d(target)  # (B, F)
+            Stt = self._welch_1d(target).view(B, 1, -1)
 
-        Srr = Srr.view(B, 1, -1)
-        Stt = Stt.view(B, 1, -1)
+        weighted_num = torch.zeros(B, device=pred.device, dtype=pred.dtype)
+        weighted_den = torch.zeros(B, device=pred.device, dtype=pred.dtype)
 
-        # Streaming accumulators.
-        weighted_num = torch.zeros(B, device=self.device).type_as(pred)
-        weighted_den = torch.zeros(B, device=self.device).type_as(pred)
+        uniform_num = torch.zeros(B, device=pred.device, dtype=pred.dtype)
+        uniform_den = torch.zeros(B, device=pred.device, dtype=pred.dtype)
 
-        uniform_num = torch.zeros(B, device=self.device).type_as(pred)
-        uniform_count = 0
-
-        # ------------------------------------------------------------
-        # Process all channels, but in chunks.
-        # This lowers memory peak but does not remove any channel.
-        # ------------------------------------------------------------
         for start in range(0, C, self.channel_chunk_size):
             end = min(start + self.channel_chunk_size, C)
+            w_chunk = witness[:, start:end, :]
 
-            w_chunk = witness[:, start:end, :]  # (B, K, T)
-            K = end - start
-
-            # --------------------------------------------------------
-            # Reference quantities do not need gradients.
-            # --------------------------------------------------------
             with torch.no_grad():
-                Sww = self._welch_channels(w_chunk)  # (B, K, F)
-
-                Stw_r, Stw_i = self._cross_x_channels(
-                    target,
-                    w_chunk,
-                )
-
+                Sww = self._welch_channels(w_chunk)
+                Stw_r, Stw_i = self._cross_x_channels(target, w_chunk)
                 Stw_mag2 = Stw_r ** 2 + Stw_i ** 2
+                coh_tgt_ref = (
+                    Stw_mag2 / (Stt * Sww + 1e-12)
+                ).detach()
 
-                coh_tgt = Stw_mag2 / (Stt * Sww + 1e-12)
-
-                # Detach explicitly: target coherence is a reference.
-                coh_tgt_ref = coh_tgt.detach()
-
-            # --------------------------------------------------------
-            # Residual-witness coherence.
-            # This path must keep gradient through residual/pred.
-            # --------------------------------------------------------
-            Srw_r, Srw_i = self._cross_x_channels(
-                residual,
-                w_chunk,
-            )
-
+            Srw_r, Srw_i = self._cross_x_channels(residual, w_chunk)
             Srw_mag2 = Srw_r ** 2 + Srw_i ** 2
-
-            # Sww is a no_grad reference. Srr carries gradient.
             coh_res = Srw_mag2 / (Srr * Sww.detach() + 1e-12)
 
-            denom = torch.clamp(
-                coh_tgt_ref,
-                min=self.coh_floor,
+            ratio = coh_res / torch.clamp(
+                coh_tgt_ref, min=self.coh_floor
             )
-
-            ratio = coh_res / denom
 
             if self.use_log:
                 ratio = torch.log1p(ratio)
 
-            # --------------------------------------------------------
-            # Frequency-level weighting inside the target band.
-            # Shape:
-            #   ratio        : (B, K, F)
-            #   freq_weights : (B, K, F)
-            # --------------------------------------------------------
+            # Only train on frequencies that had meaningful original coupling.
+            valid_freq = (
+                (coh_tgt_ref >= self.target_coh_gate).type_as(ratio)
+                * band_mask
+            )
+
             if self.weight_by_target_coh:
-                freq_weights = coh_tgt_ref * mask
-
-                freq_weight_sum = torch.sum(
-                    freq_weights,
-                    dim=2,
-                    keepdim=True,
-                )
-
-                uniform_freq_weights = mask.expand_as(freq_weights)
-
-                fallback_freq = (
-                    freq_weight_sum <= self.min_weight_sum
-                ).type_as(freq_weights)
-
-                freq_weights = (
-                    freq_weights * (1.0 - fallback_freq)
-                    + uniform_freq_weights * fallback_freq
-                )
+                freq_weights = coh_tgt_ref * valid_freq
             else:
-                freq_weights = mask.expand_as(ratio)
+                freq_weights = valid_freq
 
-            freq_weight_sum = torch.sum(freq_weights, dim=2) + 1e-12
+            freq_den = torch.sum(freq_weights, dim=2)
 
-            # Per-channel loss for this chunk, shape (B, K)
+            # Safe division. Channels with no valid frequencies get loss=0.
             loss_chunk = torch.sum(
-                ratio * freq_weights,
-                dim=2,
-            ) / freq_weight_sum
+                ratio * freq_weights, dim=2
+            ) / (freq_den + 1e-12)
 
-            # --------------------------------------------------------
-            # Channel-level weighting.
-            # Use target-witness coherence strength inside the band.
-            # Shape: (B, K)
-            # --------------------------------------------------------
+            has_valid_freq = (freq_den > 0).type_as(loss_chunk)
+            loss_chunk = loss_chunk * has_valid_freq
+
+            # Channel strength uses target coherence over the target band.
             channel_strength = torch.sum(
-                coh_tgt_ref * mask,
-                dim=2,
+                coh_tgt_ref * band_mask, dim=2
             ) / (self.n_band_bins + 1e-12)
-
-            channel_strength = channel_strength.detach()
 
             channel_weight = torch.clamp(
                 channel_strength - self.channel_coh_threshold,
                 min=0.0,
+            ) ** self.channel_weight_power
+
+            channel_weight = (
+                channel_weight.detach() * has_valid_freq.detach()
             )
 
-            channel_weight = channel_weight ** self.channel_weight_power
-            channel_weight = channel_weight.detach()
-
-            # --------------------------------------------------------
-            # Streaming accumulation.
-            # Do not store all channel losses in a list.
-            # --------------------------------------------------------
             weighted_num = weighted_num + torch.sum(
-                loss_chunk * channel_weight,
-                dim=1,
+                loss_chunk * channel_weight, dim=1
             )
-
             weighted_den = weighted_den + torch.sum(
-                channel_weight,
-                dim=1,
+                channel_weight, dim=1
             )
 
             uniform_num = uniform_num + torch.sum(
-                loss_chunk,
-                dim=1,
+                loss_chunk, dim=1
+            )
+            uniform_den = uniform_den + torch.sum(
+                has_valid_freq, dim=1
             )
 
-            uniform_count += K
-
-        # ------------------------------------------------------------
-        # Final channel aggregation.
-        # ------------------------------------------------------------
         weighted_loss = weighted_num / (weighted_den + 1e-12)
-        uniform_loss = uniform_num / (float(uniform_count) + 1e-12)
+        uniform_loss = uniform_num / (uniform_den + 1e-12)
 
         if self.fallback_to_uniform_channels:
-            fallback_channel = (
+            use_uniform = (
                 weighted_den <= self.min_channel_weight_sum
             ).type_as(weighted_loss)
-
             loss = (
-                weighted_loss * (1.0 - fallback_channel)
-                + uniform_loss * fallback_channel
+                weighted_loss * (1.0 - use_uniform)
+                + uniform_loss * use_uniform
             )
         else:
-            no_channel_weight = (
-                weighted_den <= self.min_channel_weight_sum
+            # Preferred behavior: if no physically meaningful witness exists,
+            # make the coherence term zero for that batch item.
+            has_weight = (
+                weighted_den > self.min_channel_weight_sum
             ).type_as(weighted_loss)
+            loss = weighted_loss * has_weight
 
-            loss = weighted_loss * (1.0 - no_channel_weight)
-
-        if self.reduction == 'mean':
-            return loss.mean()
-        else:
-            return loss.sum()
+        return loss.mean() if self.reduction == 'mean' else loss.sum()
 
 
 class TransferFunctionLoss(nn.Module):
     """
-    Band-limited transfer-function loss.
+    Band-limited transfer-function loss with coherence gating.
 
-    Goal
-    ----
-    Reduce the linear transfer-function-like coupling between
-    residual strain and each witness channel.
+    The TF term is only evaluated where the original target-witness coherence
+    is meaningful.  This avoids strongly penalizing frequencies where the
+    transfer-function estimate is not well supported.
 
-    residual = target - pred
-
-    For each witness channel w:
-
-        H_res(f) = S_res,w(f) / S_w,w(f)
-        H_tgt(f) = S_tgt,w(f) / S_w,w(f)
-
-    In ratio mode, minimize:
-
-        |H_res(f)|^2 / |H_tgt(f)|^2
-
-    inside the target frequency band.
-
-    This is useful when the target noise is approximately linearly
-    coupled from witness channels.
+    By default gradient boosting is disabled.  Control the strength mainly with
+    tf_weight in CompositePSDLoss.
     """
 
     def __init__(
@@ -935,15 +818,26 @@ class TransferFunctionLoss(nn.Module):
         average='mean',
         nonlinearity='log1p',
         mode='ratio',
-        grad_boost=10.0,
-        auto_grad_boost=True,
-        max_grad_boost=1e3,
         syy_floor_factor=1e-6,
         tf_floor_factor=1e-6,
-        center_weighting=True,
-        sigma_fraction=4.0,
+        target_coh_gate=0.05,
+        channel_coh_threshold=0.03,
+        channel_weight_power=1.0,
+        fallback_to_uniform_channels=False,
+        channel_chunk_size=8,
+        center_weighting=False,
+
+        # Backward-compatible gradient scaling options.
+        grad_boost=1.0,
+        auto_grad_boost=False,
+        max_grad_boost=100.0,
     ):
         super().__init__()
+
+        if reduction not in ('mean', 'sum'):
+            raise ValueError('`reduction` must be "mean" or "sum"')
+        if mode not in ('ratio', 'abs'):
+            raise ValueError("`mode` must be either 'ratio' or 'abs'")
 
         self.fs = fs
         self.device = device
@@ -952,18 +846,28 @@ class TransferFunctionLoss(nn.Module):
         self.nonlinearity = nonlinearity
         self.mode = mode
 
+        self.syy_floor_factor = float(syy_floor_factor)
+        self.tf_floor_factor = float(tf_floor_factor)
+        self.target_coh_gate = float(target_coh_gate)
+        self.channel_coh_threshold = float(channel_coh_threshold)
+        self.channel_weight_power = float(channel_weight_power)
+        self.fallback_to_uniform_channels = bool(
+            fallback_to_uniform_channels
+        )
+
+        self.channel_chunk_size = int(channel_chunk_size)
+        if self.channel_chunk_size <= 0:
+            raise ValueError("channel_chunk_size must be positive")
+
+        self.center_weighting = bool(center_weighting)
+
+        # Gradient boost is intentionally conservative/off by default.
         self.grad_boost = float(grad_boost)
         self.auto_grad_boost = bool(auto_grad_boost)
         self.max_grad_boost = float(max_grad_boost)
         self.grad_target = 1.0
         self.ema_beta = 0.9
 
-        self.syy_floor_factor = float(syy_floor_factor)
-        self.tf_floor_factor = float(tf_floor_factor)
-        self.center_weighting = bool(center_weighting)
-        self.sigma_fraction = float(sigma_fraction)
-
-        # EMA state for adaptive gradient scaling.
         self.register_buffer(
             "gb_ema",
             torch.tensor(1.0, dtype=torch.float32, device=device),
@@ -974,71 +878,53 @@ class TransferFunctionLoss(nn.Module):
         )
 
         self.nperseg = int(fftlength * fs)
-        self.noverlap = int(overlap * fs) if overlap else None
+        self.noverlap = int(overlap * fs) if overlap is not None else None
 
         freqs = torch.linspace(
-            0.,
-            fs / 2.,
-            self.nperseg // 2 + 1,
-            device=device,
+            0.0, fs / 2.0, self.nperseg // 2 + 1, device=device
         )
 
-        self.dfreq = freqs[1] - freqs[0]
-
-        freq_mask = torch.zeros_like(
-            freqs,
-            dtype=torch.uint8,
-            device=device,
-        )
-
-        # Important fix:
-        # Start from zeros, not ones.
-        # If initialized with ones, max(ones, gaussian) is always ones,
-        # so Gaussian center weighting has no effect.
-        freq_weights = torch.zeros_like(freqs, device=device)
-
-        if isinstance(fl, (float, int)):
+        if isinstance(fl, (int, float)):
             fl = [fl]
-        if isinstance(fh, (float, int)):
+        if isinstance(fh, (int, float)):
             fh = [fh]
 
-        self.scale = 0.0
+        band_mask = torch.zeros_like(freqs, dtype=torch.uint8)
+        base_weight = torch.zeros_like(freqs)
 
         for l, h in zip(fl, fh):
             band = ((freqs >= l) & (freqs <= h)).to(torch.uint8)
-            freq_mask = torch.max(freq_mask, band)
-
-            self.scale += (h - l)
+            band_mask = torch.max(band_mask, band)
 
             if self.center_weighting:
                 center = (l + h) / 2.0
                 width = max(h - l, 1e-6)
-                sigma = width / self.sigma_fraction
-
+                sigma = width / 4.0
                 gaussian = torch.exp(
                     -0.5 * ((freqs - center) / sigma) ** 2
                 )
-
-                freq_weights = torch.max(freq_weights, gaussian)
+                base_weight = torch.max(base_weight, gaussian)
             else:
-                freq_weights = torch.max(freq_weights, band.float())
+                base_weight = torch.max(
+                    base_weight, band.float()
+                )
 
-        # If something went wrong, fallback to uniform band weighting.
-        weight_in_mask = freq_weights * freq_mask.float()
-
-        if torch.sum(weight_in_mask) <= 0:
-            weight_in_mask = freq_mask.float()
-
-        # Normalize such that sum(weight * df) = 1.
-        denom = torch.sum(weight_in_mask * self.dfreq) + 1e-12
-        weight_in_mask = weight_in_mask / denom
+        base_weight = base_weight * band_mask.float()
+        if torch.sum(base_weight) <= 0:
+            base_weight = band_mask.float()
 
         self.register_buffer("freqs", freqs)
-        self.register_buffer("freq_mask", freq_mask)
-        self.register_buffer("freq_mask_float", freq_mask.float())
-        self.register_buffer("weight_in_mask", weight_in_mask)
+        self.register_buffer("band_mask", band_mask)
+        self.register_buffer("band_mask_float", band_mask.float())
+        self.register_buffer("base_weight", base_weight)
 
-    def _welch(self, x):
+        n_band_bins = torch.sum(band_mask.float())
+        self.register_buffer(
+            "n_band_bins",
+            torch.clamp(n_band_bins, min=1.0),
+        )
+
+    def _welch_1d(self, x):
         return _torch_welch(
             x,
             fs=self.fs,
@@ -1048,8 +934,18 @@ class TransferFunctionLoss(nn.Module):
             device=self.device,
         )
 
-    def _cross_welch(self, x, y):
-        return _torch_cross_welch(
+    def _welch_channels(self, x):
+        return _torch_welch_channels(
+            x,
+            fs=self.fs,
+            nperseg=self.nperseg,
+            noverlap=self.noverlap,
+            average=self.average,
+            device=self.device,
+        )
+
+    def _cross_x_channels(self, x, y):
+        return _torch_cross_welch_x_channels(
             x,
             y,
             fs=self.fs,
@@ -1059,37 +955,26 @@ class TransferFunctionLoss(nn.Module):
             device=self.device,
         )
 
-    def apply_nonlinearity(self, x):
+    def _apply_nonlinearity(self, x):
         if self.nonlinearity == 'log1p':
             return torch.log1p(x)
-        elif self.nonlinearity == 'sqrt':
+        if self.nonlinearity == 'sqrt':
             return torch.sqrt(x + 1e-12)
-        elif self.nonlinearity == 'none':
+        if self.nonlinearity in ('none', None):
             return x
-        else:
-            return x
+        raise ValueError(
+            "`nonlinearity` must be 'log1p', 'sqrt', or 'none'"
+        )
 
     def _compute_grad_scale(self, x):
-        """
-        Adaptive gradient scaling.
-
-        The forward value is preserved, but the gradient can be scaled.
-        This helps when TF loss is numerically small.
-
-        This should still be used carefully. Start with very small
-        TF_WEIGHT, e.g. 0.001 to 0.01.
-        """
-
         if not self.auto_grad_boost:
             return self.grad_boost
 
         with torch.no_grad():
-            cur_med = x.detach().median()
+            cur_med = x.detach().median().clamp(min=1e-12)
 
             if self.gb_inited.item() == 0:
-                self.gb_ema.copy_(
-                    cur_med.clamp(min=1e-12).float()
-                )
+                self.gb_ema.copy_(cur_med.float())
                 self.gb_inited.fill_(1)
 
             self.gb_ema.mul_(self.ema_beta).add_(
@@ -1100,163 +985,518 @@ class TransferFunctionLoss(nn.Module):
                 self.grad_target * self.grad_boost
             ) / (float(self.gb_ema.item()) + 1e-12)
 
-            scale = max(1.0, min(scale, self.max_grad_boost))
-
-            return scale
+            return max(1.0, min(scale, self.max_grad_boost))
 
     def forward(self, pred, target, witness):
-        """
-        Parameters
-        ----------
-        pred : torch.Tensor
-            Predicted noise, shape (B, T)
-
-        target : torch.Tensor
-            Target strain, shape (B, T)
-
-        witness : torch.Tensor
-            Witness channels, shape (B, C, T)
-        """
-
         residual = target - pred
-        B, C, T = witness.shape
 
-        weights = self.weight_in_mask.view(1, -1)
+        if witness.ndim != 3:
+            raise ValueError("witness must have shape (B, C, T)")
 
-        channel_losses = []
+        B, C, _ = witness.shape
+        if C == 0:
+            return torch.sum(pred * 0.0)
 
-        for i in range(C):
-            w = witness[:, i, :]
+        band_mask = self.band_mask_float.view(1, 1, -1)
+        base_weight = self.base_weight.view(1, 1, -1)
 
-            # Cross spectra
-            Rxy_r, Rxy_i = self._cross_welch(residual, w)
-            Txy_r, Txy_i = self._cross_welch(target, w)
+        # Target PSD is a reference quantity.
+        with torch.no_grad():
+            Stt = self._welch_1d(target).view(B, 1, -1)
 
-            # Witness auto spectrum
-            Syy = self._welch(w)
+        weighted_num = torch.zeros(B, device=pred.device, dtype=pred.dtype)
+        weighted_den = torch.zeros(B, device=pred.device, dtype=pred.dtype)
 
-            # Adaptive floor for witness auto spectrum.
-            syy_band = torch.sum(
-                Syy * weights,
-                dim=1,
-                keepdim=True,
+        uniform_num = torch.zeros(B, device=pred.device, dtype=pred.dtype)
+        uniform_den = torch.zeros(B, device=pred.device, dtype=pred.dtype)
+
+        for start in range(0, C, self.channel_chunk_size):
+            end = min(start + self.channel_chunk_size, C)
+            w_chunk = witness[:, start:end, :]
+
+            # References: no gradient needed.
+            with torch.no_grad():
+                Sww = self._welch_channels(w_chunk)
+                Stw_r, Stw_i = self._cross_x_channels(
+                    target, w_chunk
+                )
+                Stw_mag2 = Stw_r ** 2 + Stw_i ** 2
+
+                coh_tgt_ref = (
+                    Stw_mag2 / (Stt * Sww + 1e-12)
+                ).detach()
+
+                # Adaptive Sww floor based on band mean.
+                sww_band_mean = torch.sum(
+                    Sww * band_mask, dim=2, keepdim=True
+                ) / (self.n_band_bins + 1e-12)
+
+                syy_floor = (
+                    self.syy_floor_factor * sww_band_mean
+                    + 1e-12
+                ).type_as(Sww)
+
+                Sww_safe = torch.maximum(
+                    Sww, syy_floor.expand_as(Sww)
+                )
+
+                Htgt2 = Stw_mag2 / (Sww_safe ** 2 + 1e-24)
+                Htgt2_ref = Htgt2.detach()
+
+            # Residual-witness cross spectrum keeps gradient through residual.
+            Srw_r, Srw_i = self._cross_x_channels(
+                residual, w_chunk
             )
+            Srw_mag2 = Srw_r ** 2 + Srw_i ** 2
 
-            syy_floor = (
-                self.syy_floor_factor * syy_band
-                + 1e-12
-            ).type_as(Syy)
-
-            Syy_safe = torch.max(
-                Syy,
-                syy_floor.expand_as(Syy),
-            )
-
-            # |H_res|^2
-            Rtf = (
-                (Rxy_r / Syy_safe) ** 2
-                + (Rxy_i / Syy_safe) ** 2
+            Hres2 = Srw_mag2 / (
+                Sww_safe.detach() ** 2 + 1e-24
             )
 
             if self.mode == 'ratio':
-                # |H_target|^2
-                Ttf = (
-                    (Txy_r / Syy_safe) ** 2
-                    + (Txy_i / Syy_safe) ** 2
-                )
+                h_tgt_band = torch.sum(
+                    Htgt2_ref * band_mask, dim=2, keepdim=True
+                ) / (self.n_band_bins + 1e-12)
 
-                Ttf_ref = Ttf.detach()
-
-                # Adaptive floor for target transfer function.
-                ttf_band = torch.sum(
-                    Ttf_ref * weights,
-                    dim=1,
-                    keepdim=True,
-                )
-
-                ttf_floor = (
-                    self.tf_floor_factor * ttf_band
+                tf_floor = (
+                    self.tf_floor_factor * h_tgt_band
                     + 1e-12
-                ).type_as(Ttf)
+                ).type_as(Htgt2_ref)
 
-                Ttf_safe = torch.max(
-                    Ttf_ref,
-                    ttf_floor.expand_as(Ttf_ref),
+                Htgt2_safe = torch.maximum(
+                    Htgt2_ref,
+                    tf_floor.expand_as(Htgt2_ref),
                 )
 
-                x = Rtf / Ttf_safe
-
-            elif self.mode == 'abs':
-                x = Rtf
-
+                x = Hres2 / Htgt2_safe
             else:
-                raise ValueError(
-                    "`mode` must be either 'ratio' or 'abs'"
-                )
+                x = Hres2
 
-            # Band-limited weighted average.
-            x = self.apply_nonlinearity(x)
+            x = self._apply_nonlinearity(x)
 
-            x_weighted = x * weights
+            # Only use TF where original coherence supports a real coupling.
+            valid_freq = (
+                (coh_tgt_ref >= self.target_coh_gate).type_as(x)
+                * band_mask
+            )
 
-            # Scale gradient only, not the forward value.
-            scale = self._compute_grad_scale(x_weighted)
-            x_weighted = _grad_scale(x_weighted, scale)
+            # Share the same physics idea as CoherenceLoss:
+            # high original coherence gets higher frequency weight.
+            freq_weights = (
+                base_weight
+                * coh_tgt_ref
+                * valid_freq
+            )
 
-            loss_i = torch.sum(x_weighted, dim=1)
+            freq_den = torch.sum(freq_weights, dim=2)
+            loss_chunk = torch.sum(
+                x * freq_weights, dim=2
+            ) / (freq_den + 1e-12)
 
-            channel_losses.append(loss_i)
+            has_valid_freq = (freq_den > 0).type_as(loss_chunk)
+            loss_chunk = loss_chunk * has_valid_freq
 
-        loss = torch.stack(channel_losses, dim=1).mean(dim=1)
+            # Optional gradient-only scaling; default is exactly 1.
+            scale = self._compute_grad_scale(loss_chunk)
+            if scale != 1.0:
+                loss_chunk = _grad_scale(loss_chunk, scale)
 
-        if self.reduction == 'mean':
-            return loss.mean()
+            channel_strength = torch.sum(
+                coh_tgt_ref * band_mask, dim=2
+            ) / (self.n_band_bins + 1e-12)
+
+            channel_weight = torch.clamp(
+                channel_strength - self.channel_coh_threshold,
+                min=0.0,
+            ) ** self.channel_weight_power
+
+            channel_weight = (
+                channel_weight.detach() * has_valid_freq.detach()
+            )
+
+            weighted_num = weighted_num + torch.sum(
+                loss_chunk * channel_weight, dim=1
+            )
+            weighted_den = weighted_den + torch.sum(
+                channel_weight, dim=1
+            )
+
+            uniform_num = uniform_num + torch.sum(
+                loss_chunk, dim=1
+            )
+            uniform_den = uniform_den + torch.sum(
+                has_valid_freq, dim=1
+            )
+
+        weighted_loss = weighted_num / (weighted_den + 1e-12)
+        uniform_loss = uniform_num / (uniform_den + 1e-12)
+
+        if self.fallback_to_uniform_channels:
+            use_uniform = (weighted_den <= 1e-8).type_as(weighted_loss)
+            loss = (
+                weighted_loss * (1.0 - use_uniform)
+                + uniform_loss * use_uniform
+            )
         else:
-            return loss.sum()
+            has_weight = (weighted_den > 1e-8).type_as(weighted_loss)
+            loss = weighted_loss * has_weight
+
+        return loss.mean() if self.reduction == 'mean' else loss.sum()
 
 
 class CompositePSDLoss(nn.Module):
-    def __init__(self, fs, fl, fh, fftlength=1.0, overlap=None, reduction='mean',
-                 device='cpu', psd_weight=0.3, mse_weight=0.2, tf_weight=0.3,
-                 coh_weight=0.2, average='mean', nonlinearity='log1p'):
+    """
+    Composite DeepClean loss.
+
+    IMPORTANT:
+    The weights are independent coefficients. They are NOT normalized and
+    do NOT need to sum to 1.
+
+    Recommended baseline for the user's current comparison:
+        PSD = 1.0
+        MSE = 0.0
+        COH = 0.0
+        TF  = 0.0
+
+    Suggested additive studies:
+        PSD=1.0, COH=0.03
+        PSD=1.0, COH=0.05
+        PSD=1.0, COH=0.07
+        PSD=1.0, TF=0.001
+        PSD=1.0, COH=0.05, TF=0.001
+
+    Timing
+    ------
+    Set enable_timing=True to measure forward-computation time of each loss.
+    GPU timing uses torch.cuda.synchronize() around each timed component.
+    This is accurate for profiling but adds synchronization overhead, so use
+    it for benchmark runs rather than every production run.
+    """
+
+    def __init__(
+        self,
+        fs,
+        fl,
+        fh,
+        fftlength=1.0,
+        overlap=None,
+        reduction='mean',
+        device='cpu',
+
+        # Preserve the user's PSD-only historical baseline.
+        psd_weight=1.0,
+        mse_weight=0.0,
+        coh_weight=0.0,
+        tf_weight=0.0,
+
+        average='mean',
+        nonlinearity='log1p',
+        asd=True,
+
+        # Coherence/TF physics controls.
+        target_coh_gate=0.05,
+        channel_coh_threshold=0.03,
+        channel_chunk_size=8,
+
+        # Timing controls.
+        enable_timing=False,
+        timing_warmup=5,
+    ):
         super().__init__()
+
+        if any(
+            float(w) < 0.0
+            for w in (
+                psd_weight,
+                mse_weight,
+                coh_weight,
+                tf_weight,
+            )
+        ):
+            raise ValueError("Loss weights must be non-negative")
+
+        if (
+            float(psd_weight)
+            + float(mse_weight)
+            + float(coh_weight)
+            + float(tf_weight)
+        ) <= 0:
+            raise ValueError("At least one loss weight must be > 0")
+
+        # Deliberately DO NOT check that weights sum to 1.
         self.reduction = reduction
-        self.psd_weight = psd_weight
-        self.mse_weight = mse_weight
-        self.coh_weight = coh_weight
-        self.tf_weight = tf_weight
+        self.psd_weight = float(psd_weight)
+        self.mse_weight = float(mse_weight)
+        self.coh_weight = float(coh_weight)
+        self.tf_weight = float(tf_weight)
         self.device = device
+        self.asd = asd
 
-        self.mse_loss = nn.MSELoss(reduction=reduction)
-        self.psd_loss = PSDLoss(fs, fl, fh, fftlength, overlap, reduction=reduction,
-                                device=device, average=average)
-        self.coh_loss = CoherenceLoss(fs, fl, fh, fftlength, overlap, reduction=reduction,
-                                      device=device, average=average)
-        self.tf_loss = TransferFunctionLoss(fs, fl, fh, fftlength, overlap, reduction=reduction,
-                                            device=device, average=average, nonlinearity=nonlinearity)
+        self.mse_loss = MSELoss(reduction=reduction)
+
+        self.psd_loss = PSDLoss(
+            fs=fs,
+            fl=fl,
+            fh=fh,
+            fftlength=fftlength,
+            overlap=overlap,
+            asd=asd,
+            average=average,
+            reduction=reduction,
+            device=device,
+        )
+
+        self.coh_loss = CoherenceLoss(
+            fs=fs,
+            fl=fl,
+            fh=fh,
+            fftlength=fftlength,
+            overlap=overlap,
+            reduction=reduction,
+            device=device,
+            average=average,
+            target_coh_gate=target_coh_gate,
+            channel_coh_threshold=channel_coh_threshold,
+            fallback_to_uniform_channels=False,
+            channel_chunk_size=channel_chunk_size,
+        )
+
+        self.tf_loss = TransferFunctionLoss(
+            fs=fs,
+            fl=fl,
+            fh=fh,
+            fftlength=fftlength,
+            overlap=overlap,
+            reduction=reduction,
+            device=device,
+            average=average,
+            nonlinearity=nonlinearity,
+            target_coh_gate=target_coh_gate,
+            channel_coh_threshold=channel_coh_threshold,
+            fallback_to_uniform_channels=False,
+            channel_chunk_size=channel_chunk_size,
+            grad_boost=1.0,
+            auto_grad_boost=False,
+        )
+
         self.latest_loss_values = {
-            'mse': 0.0, 'psd': 0.0, 'coh': 0.0, 'tf': 0.0, 'total': 0.0}
+            'mse': 0.0,
+            'psd': 0.0,
+            'coh': 0.0,
+            'tf': 0.0,
+            'total': 0.0,
+        }
 
-    def forward(self, pred, target, witness, return_dict=False):
-        loss = 0.0
-        comps = {}
-        if self.mse_weight > 0:
-            v = self.mse_loss(pred, target)
-            loss += self.mse_weight * v
-            comps['mse'] = v.item()
+        self.latest_weighted_loss_values = {
+            'mse': 0.0,
+            'psd': 0.0,
+            'coh': 0.0,
+            'tf': 0.0,
+            'total': 0.0,
+        }
+
+        self.enable_timing = bool(enable_timing)
+        self.timing_warmup = max(0, int(timing_warmup))
+        self._forward_calls = 0
+
+        self.latest_loss_timings = {
+            'mse': 0.0,
+            'psd': 0.0,
+            'coh': 0.0,
+            'tf': 0.0,
+            'criterion_total': 0.0,
+        }
+
+        self._timing_total_seconds = {
+            'mse': 0.0,
+            'psd': 0.0,
+            'coh': 0.0,
+            'tf': 0.0,
+            'criterion_total': 0.0,
+        }
+
+        self._timing_calls = {
+            'mse': 0,
+            'psd': 0,
+            'coh': 0,
+            'tf': 0,
+            'criterion_total': 0,
+        }
+
+    def _sync_if_needed(self, ref_tensor):
+        if (
+            self.enable_timing
+            and isinstance(ref_tensor, torch.Tensor)
+            and ref_tensor.is_cuda
+        ):
+            torch.cuda.synchronize(ref_tensor.device)
+
+    def _timed_call(self, name, fn, ref_tensor):
+        if not self.enable_timing:
+            return fn(), 0.0
+
+        self._sync_if_needed(ref_tensor)
+        t0 = time.perf_counter()
+        value = fn()
+        self._sync_if_needed(ref_tensor)
+        elapsed = time.perf_counter() - t0
+
+        return value, elapsed
+
+    def reset_timing_stats(self):
+        self._forward_calls = 0
+        for key in self.latest_loss_timings:
+            self.latest_loss_timings[key] = 0.0
+            self._timing_total_seconds[key] = 0.0
+            self._timing_calls[key] = 0
+
+    def get_timing_summary(self):
+        """
+        Returns a dictionary:
+            {
+              'psd': {'calls': ..., 'total_s': ..., 'mean_ms': ...},
+              ...
+            }
+        """
+        summary = {}
+        for key in self._timing_total_seconds:
+            calls = self._timing_calls[key]
+            total_s = self._timing_total_seconds[key]
+            summary[key] = {
+                'calls': calls,
+                'total_s': total_s,
+                'mean_ms': (
+                    1000.0 * total_s / calls
+                    if calls > 0 else 0.0
+                ),
+            }
+        return summary
+
+    def format_timing_summary(self):
+        summary = self.get_timing_summary()
+        lines = [
+            "Loss forward timing "
+            "(warm-up calls excluded):"
+        ]
+        for key in ('psd', 'mse', 'coh', 'tf', 'criterion_total'):
+            s = summary[key]
+            lines.append(
+                f"  {key:15s}: "
+                f"{s['mean_ms']:10.3f} ms/call  "
+                f"{s['total_s']:10.3f} s total  "
+                f"({s['calls']} calls)"
+            )
+        return "\n".join(lines)
+
+    def _record_timing(self, key, elapsed, record):
+        self.latest_loss_timings[key] = float(elapsed)
+        if record:
+            self._timing_total_seconds[key] += float(elapsed)
+            self._timing_calls[key] += 1
+
+    def forward(
+        self,
+        pred,
+        target,
+        witness,
+        return_dict=False,
+    ):
+        self._forward_calls += 1
+        record_timing = (
+            self.enable_timing
+            and self._forward_calls > self.timing_warmup
+        )
+
+        # Reset every call so inactive terms never show stale values.
+        raw = {
+            'mse': 0.0,
+            'psd': 0.0,
+            'coh': 0.0,
+            'tf': 0.0,
+        }
+        weighted = {
+            'mse': 0.0,
+            'psd': 0.0,
+            'coh': 0.0,
+            'tf': 0.0,
+        }
+        for key in self.latest_loss_timings:
+            self.latest_loss_timings[key] = 0.0
+
+        self._sync_if_needed(pred)
+        total_t0 = time.perf_counter() if self.enable_timing else None
+
+        # Tensor-valued zero keeps graph/device/dtype consistent.
+        loss = torch.sum(pred * 0.0)
+
         if self.psd_weight > 0:
-            v = self.psd_loss(pred, target)
-            loss += self.psd_weight * v
-            comps['psd'] = v.item()
+            v, elapsed = self._timed_call(
+                'psd',
+                lambda: self.psd_loss(pred, target),
+                pred,
+            )
+            loss = loss + self.psd_weight * v
+            raw['psd'] = float(v.detach().item())
+            weighted['psd'] = self.psd_weight * raw['psd']
+            self._record_timing('psd', elapsed, record_timing)
+
+        if self.mse_weight > 0:
+            v, elapsed = self._timed_call(
+                'mse',
+                lambda: self.mse_loss(pred, target),
+                pred,
+            )
+            loss = loss + self.mse_weight * v
+            raw['mse'] = float(v.detach().item())
+            weighted['mse'] = self.mse_weight * raw['mse']
+            self._record_timing('mse', elapsed, record_timing)
+
         if self.coh_weight > 0:
-            v = self.coh_loss(pred, target, witness)
-            loss += self.coh_weight * v
-            comps['coh'] = v.item()
+            v, elapsed = self._timed_call(
+                'coh',
+                lambda: self.coh_loss(pred, target, witness),
+                pred,
+            )
+            loss = loss + self.coh_weight * v
+            raw['coh'] = float(v.detach().item())
+            weighted['coh'] = self.coh_weight * raw['coh']
+            self._record_timing('coh', elapsed, record_timing)
+
         if self.tf_weight > 0:
-            v = self.tf_loss(pred, target, witness)
-            loss += self.tf_weight * v
-            comps['tf'] = v.item()
-        self.latest_loss_values.update(comps)
-        self.latest_loss_values['total'] = loss.item() if isinstance(
-            loss, torch.Tensor) else float(loss)
-        return (loss, self.latest_loss_values) if return_dict else loss
+            v, elapsed = self._timed_call(
+                'tf',
+                lambda: self.tf_loss(pred, target, witness),
+                pred,
+            )
+            loss = loss + self.tf_weight * v
+            raw['tf'] = float(v.detach().item())
+            weighted['tf'] = self.tf_weight * raw['tf']
+            self._record_timing('tf', elapsed, record_timing)
+
+        if self.enable_timing:
+            self._sync_if_needed(pred)
+            total_elapsed = time.perf_counter() - total_t0
+            self._record_timing(
+                'criterion_total',
+                total_elapsed,
+                record_timing,
+            )
+
+        total_value = float(loss.detach().item())
+        self.latest_loss_values = {
+            **raw,
+            'total': total_value,
+        }
+        self.latest_weighted_loss_values = {
+            **weighted,
+            'total': total_value,
+        }
+
+        if return_dict:
+            return loss, {
+                'raw': dict(self.latest_loss_values),
+                'weighted': dict(self.latest_weighted_loss_values),
+                'timing_s': dict(self.latest_loss_timings),
+            }
+
+        return loss
