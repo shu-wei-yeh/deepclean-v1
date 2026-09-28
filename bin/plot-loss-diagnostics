@@ -1,0 +1,294 @@
+#!/usr/bin/env python
+
+import argparse
+import os
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+COMPONENTS = [
+    'mse',
+    'psd',
+    'coh',
+    'tf',
+]
+
+
+def load_metric(metrics_dir, name):
+
+    path = os.path.join(
+        metrics_dir,
+        f'{name}.dat'
+    )
+
+    if not os.path.isfile(path):
+        return None
+
+    data = np.loadtxt(
+        path,
+        delimiter=',',
+        comments='#'
+    )
+
+    data = np.atleast_2d(data)
+
+    epoch = data[:, 1]
+    train = data[:, 2]
+    val = data[:, 3]
+
+    return epoch, train, val
+
+
+def normalize(x):
+
+    x = np.asarray(x)
+
+    valid = np.where(
+        np.isfinite(x)
+        & (np.abs(x) > 1e-12)
+    )[0]
+
+    if len(valid) == 0:
+        return x
+
+    return x / x[valid[0]]
+
+
+def main():
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        'train_dir'
+    )
+
+    args = parser.parse_args()
+
+    metrics_dir = os.path.join(
+        args.train_dir,
+        'metrics'
+    )
+
+    # ==============================================================
+    # 1. Normalized total composite loss
+    # ==============================================================
+
+    result = load_metric(
+        metrics_dir,
+        'loss'
+    )
+
+    if result is not None:
+
+        epoch, train, val = result
+
+        fig, ax = plt.subplots(
+            figsize=(8, 5)
+        )
+
+        ax.plot(
+            epoch,
+            normalize(train),
+            label='Train'
+        )
+
+        ax.plot(
+            epoch,
+            normalize(val),
+            label='Validation'
+        )
+
+        ax.axhline(
+            1.0,
+            linestyle='--',
+            linewidth=1
+        )
+
+        ax.set_xlabel('Epoch')
+
+        ax.set_ylabel(
+            'Normalized composite loss'
+        )
+
+        ax.legend()
+
+        fig.tight_layout()
+
+        fig.savefig(
+            os.path.join(
+                metrics_dir,
+                'loss_normalized.png'
+            ),
+            dpi=300
+        )
+
+        plt.close(fig)
+
+    # ==============================================================
+    # 2. Normalized individual validation losses
+    # ==============================================================
+
+    fig, ax = plt.subplots(
+        figsize=(8, 5)
+    )
+
+    plotted = False
+
+    for name in COMPONENTS:
+
+        result = load_metric(
+            metrics_dir,
+            f'{name}_raw'
+        )
+
+        if result is None:
+            continue
+
+        epoch, _, val = result
+
+        if np.allclose(val, 0):
+            continue
+
+        ax.plot(
+            epoch,
+            normalize(val),
+            label=name.upper()
+        )
+
+        plotted = True
+
+    if plotted:
+
+        ax.axhline(
+            1.0,
+            linestyle='--',
+            linewidth=1
+        )
+
+        ax.set_xlabel('Epoch')
+
+        ax.set_ylabel(
+            'Normalized validation loss'
+        )
+
+        ax.legend()
+
+        fig.tight_layout()
+
+        fig.savefig(
+            os.path.join(
+                metrics_dir,
+                'individual_losses_normalized.png'
+            ),
+            dpi=300
+        )
+
+    plt.close(fig)
+
+    # ==============================================================
+    # 3. Weighted contribution percentage
+    # ==============================================================
+
+    fig, ax = plt.subplots(
+        figsize=(8, 5)
+    )
+
+    plotted = False
+
+    for name in COMPONENTS:
+
+        result = load_metric(
+            metrics_dir,
+            f'{name}_pct'
+        )
+
+        if result is None:
+            continue
+
+        epoch, _, val = result
+
+        if np.allclose(val, 0):
+            continue
+
+        ax.plot(
+            epoch,
+            val,
+            label=name.upper()
+        )
+
+        plotted = True
+
+    if plotted:
+
+        ax.set_xlabel('Epoch')
+
+        ax.set_ylabel(
+            'Validation loss contribution [%]'
+        )
+
+        ax.set_ylim(
+            0,
+            100
+        )
+
+        ax.legend()
+
+        fig.tight_layout()
+
+        fig.savefig(
+            os.path.join(
+                metrics_dir,
+                'loss_contribution_percentage.png'
+            ),
+            dpi=300
+        )
+
+    plt.close(fig)
+
+    # ==============================================================
+    # Final epoch summary
+    # ==============================================================
+
+    print()
+    print('Final validation loss decomposition')
+    print('-----------------------------------')
+
+    for name in COMPONENTS:
+
+        raw = load_metric(
+            metrics_dir,
+            f'{name}_raw'
+        )
+
+        weighted = load_metric(
+            metrics_dir,
+            f'{name}_weighted'
+        )
+
+        pct = load_metric(
+            metrics_dir,
+            f'{name}_pct'
+        )
+
+        if (
+            raw is None
+            or weighted is None
+            or pct is None
+        ):
+            continue
+
+        raw_value = raw[2][-1]
+        weighted_value = weighted[2][-1]
+        pct_value = pct[2][-1]
+
+        print(
+            f'{name.upper():4s} | '
+            f'raw = {raw_value:.6e} | '
+            f'weighted = {weighted_value:.6e} | '
+            f'contribution = {pct_value:.2f}%'
+        )
+
+
+if __name__ == '__main__':
+    main()
